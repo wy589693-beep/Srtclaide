@@ -23,37 +23,58 @@ BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 GEMINI_KEY = os.environ["GEMINI_API_KEY"]
 MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash")
 MAX_MB = int(os.environ.get("MAX_FILE_MB", "1000"))
-CHUNK_SEC = int(os.environ.get("CHUNK_SECONDS", "600"))  # 10 minutes
+CHUNK_SEC = int(os.environ.get("CHUNK_SECONDS", "300"))  # 5 minutes (shorter = less timing drift)
+MAX_CUE = int(os.environ.get("MAX_CUE_CHARS", "36"))    # max visible characters per subtitle
+LINE_LEN = int(os.environ.get("LINE_CHARS", "22"))      # wrap to a 2nd line after this many
+SHIFT_MS = int(os.environ.get("SUB_DELAY_MS", "0"))     # +/- manual timing shift (ms), e.g. -300
+CONTEXT = os.environ.get("VIDEO_CONTEXT", "").strip()   # optional hint, e.g. "anime recap, narrator voice"
 # Private bot: comma-separated Telegram user IDs allowed to use it, e.g. "123456789,987654321"
 ALLOWED = {int(x) for x in re.split(r"[,\s]+", os.environ.get("ALLOWED_USER_IDS", "").strip()) if x.isdigit()}
 
 FFMPEG = imageio_ffmpeg.get_ffmpeg_exe()
 client = genai.Client(api_key=GEMINI_KEY)
 
-PROMPT = """Listen to this audio clip carefully and transcribe all speech into Myanmar (Burmese).
-Output ONLY a valid SRT subtitle file, nothing else (no explanations, no markdown code fences).
-Rules:
-- Number entries from 1.
-- Timestamp format: HH:MM:SS,mmm --> HH:MM:SS,mmm
-- Timestamps are relative to the start of THIS clip (the clip starts at 00:00:00,000).
-- Each entry is one short sentence/phrase (max 2 lines, about 42 characters per line).
-- Timestamps must match when words are actually spoken, in order, no overlaps.
-- If the speech is another language, translate into natural Myanmar.
-- If there is no speech, output nothing.
-- Use Myanmar Unicode (not Zawgyi).
+PROMPT = """You are a professional Burmese subtitle translator and timer.
+Listen to this audio clip and write Myanmar (Burmese) subtitles for everything that is spoken.
+Output ONLY a valid SRT file (no explanations, no markdown fences).
+
+TRANSLATION QUALITY (most important):
+- Translate the MEANING, not word by word. Write the way a native Burmese speaker would naturally say it
+  in everyday spoken Burmese (conversational style, natural particles like ပါတယ်/တယ်/လေ/ဟာ), never stiff or literal.
+- Keep the same tone as the speaker (funny, serious, dramatic). Keep names consistent through the whole clip.
+- Do not add, invent or skip content. Ignore filler sounds. Use Myanmar Unicode (never Zawgyi).
+
+SUBTITLE LAYOUT:
+- Each subtitle must be SHORT: one phrase or short sentence, at most about 30 Myanmar characters in total
+  (hard limit 36). Split long sentences into several consecutive subtitles at natural phrase breaks.
+- Put a normal space between phrases inside a subtitle so it can be wrapped. Never write one huge block.
+- Each subtitle should last about 1 to 5 seconds.
+
+TIMING:
+- Timestamp format HH:MM:SS,mmm --> HH:MM:SS,mmm, relative to the start of THIS clip (starts at 00:00:00,000).
+- A subtitle must appear exactly when its words start being spoken and disappear when they end.
+  Do not start early, do not stretch across silence, no overlaps, strictly increasing order.
+- Number entries from 1. If there is no speech, output nothing.
 """
 
-# ---------- Flask keep-alive (for Render) ----------
-web = Flask(__name__)
+# ---------- Web server (keeps Render awake; also serves the video site if videosite.py exists) ----------
+try:
+    from videosite import app as web  # members video site (same service, same free hours)
+except Exception as e:  # not uploaded / not configured: fall back to a tiny keep-alive page
+    print("videosite not loaded:", e)
+    web = Flask(__name__)
 
+    @web.route("/")
+    def home():
+        return "Bot is running"
 
-@web.route("/")
-def home():
-    return "Bot is running"
+    @web.route("/healthz")
+    def healthz():
+        return "ok"
 
 
 def run_web():
-    web.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
+    web.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)), threaded=True)
 
 
 # ---------- SRT helpers ----------
@@ -86,16 +107,115 @@ def fmt_ts(ms):
     return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
 
 
+import unicodedata
+
+_SPLIT_AFTER = "။"
+
+
+def vlen(t):
+    """Visible length: skip combining marks (Myanmar vowel signs/asat) so 1 syllable ~ 1 char."""
+    return sum(1 for c in t if not unicodedata.category(c).startswith("M") and c != "\u200b")
+
+
+def _hard_split(tok, limit):
+    """Split a space-less Myanmar string at syllable starts so each piece <= limit visible chars."""
+    pieces = []
+    while vlen(tok) > limit:
+        cut, count = None, 0
+        for i, c in enumerate(tok):
+            if not unicodedata.category(c).startswith("M"):
+                count += 1
+            if count > limit:
+                break
+            starts = (
+                i > 0 and "\u1000" <= c <= "\u1021"
+                and tok[i - 1] not in "\u1039"
+                and not (i + 1 < len(tok) and tok[i + 1] in "\u103a\u1039")
+            )
+            if starts:
+                cut = i
+        if not cut:
+            break
+        pieces.append(tok[:cut])
+        tok = tok[cut:]
+    pieces.append(tok)
+    return pieces
+
+
+def _pack(text, limit):
+    """Cut text into pieces <= limit visible chars, preferring '။' and spaces."""
+    toks = []
+    for part in re.split(r"(?<=%s)\s*|\s+" % _SPLIT_AFTER, text):
+        if part:
+            toks.extend(_hard_split(part, limit))
+    pieces, cur = [], ""
+    for t in toks:
+        cand = (cur + " " + t) if cur else t
+        if cur and vlen(cand) > limit:
+            pieces.append(cur)
+            cur = t
+        else:
+            cur = cand
+        if cur.endswith(_SPLIT_AFTER) and vlen(cur) >= limit // 2:
+            pieces.append(cur)
+            cur = ""
+    if cur:
+        pieces.append(cur)
+    return pieces
+
+
+def _wrap(text):
+    """Break one cue into max 2 balanced lines."""
+    if vlen(text) <= LINE_LEN or " " not in text:
+        return text
+    words, best, total = text.split(" "), None, vlen(text)
+    for i in range(1, len(words)):
+        left = vlen(" ".join(words[:i]))
+        d = abs(total / 2 - left)
+        if best is None or d < best[0]:
+            best = (d, i)
+    i = best[1]
+    return " ".join(words[:i]) + "\n" + " ".join(words[i:])
+
+
+def refine(rows):
+    """rows: sorted list of (start, end, text). Split long cues, fix timing/overlaps, wrap lines."""
+    out = []
+    for s, e, body in rows:
+        text = " ".join(body.split())
+        if e <= s:
+            e = s + 2000
+        pieces = _pack(text, MAX_CUE) or [text]
+        weights = [max(1, vlen(p)) for p in pieces]
+        total, t = sum(weights), s
+        for p, w in zip(pieces, weights):
+            dur = (e - s) * w / total
+            out.append([int(t), int(t + dur), p])
+            t += dur
+    # reading-speed cap, no overlaps, minimum length
+    for i, r in enumerate(out):
+        limit = 1200 + vlen(r[2]) * 140
+        r[1] = min(r[1], r[0] + min(limit, 7000))
+        if i + 1 < len(out) and r[1] > out[i + 1][0] - 30:
+            r[1] = out[i + 1][0] - 30
+        if r[1] < r[0] + 700:
+            r[1] = r[0] + 700
+            if i + 1 < len(out) and r[1] > out[i + 1][0]:
+                out[i + 1][0] = r[1] + 30
+    return [(a, b, _wrap(c)) for a, b, c in out]
+
+
 def merge_srt(chunks):
     """chunks: list of (offset_ms, entries). Returns final SRT text."""
     rows = []
     for offset, entries in chunks:
         for start, end, body in entries:
-            s, e = start + offset, end + offset
+            s, e = max(0, start + offset + SHIFT_MS), max(0, end + offset + SHIFT_MS)
             if e <= s:
                 e = s + 1000
             rows.append((s, e, body))
     rows.sort(key=lambda r: r[0])
+    rows = refine(rows)
     lines = []
     for i, (s, e, body) in enumerate(rows, 1):
         lines.append(f"{i}\n{fmt_ts(s)} --> {fmt_ts(e)}\n{body}\n")
@@ -129,7 +249,8 @@ def transcribe_chunk(path):
                 f = client.files.get(name=f.name)
             if f.state.name != "ACTIVE":
                 raise RuntimeError(f"Gemini upload failed: {f.state.name}")
-            resp = client.models.generate_content(model=MODEL, contents=[PROMPT, f])
+            prompt = PROMPT + (f"\nVideo context: {CONTEXT}\n" if CONTEXT else "")
+            resp = client.models.generate_content(model=MODEL, contents=[prompt, f])
             return resp.text or ""
         except Exception as e:  # retry a couple of times
             last = e
