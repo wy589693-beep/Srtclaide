@@ -1,4 +1,4 @@
-telethon>=1.36
-google-genai
+pyrofork
+tgcrypto
 flask
-imageio-ffmpeg
+google-genai
