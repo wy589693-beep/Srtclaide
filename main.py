@@ -1,108 +1,43 @@
-"""Telegram bot (Pyrogram/MTProto): 1) split videos into 1-5 min parts with 5s overlap,
-2) Myanmar .srt subtitles via Gemini (same SRT engine as the old SRT bot).
-Admin-approved users only.
+"""Telegram bot (MTProto via Telethon): send big mp3/mp4 -> get Myanmar .srt (Gemini API).
+
+Long media is converted to small mono mp3, split into chunks, each chunk is
+transcribed separately, then timestamps are shifted and merged into one SRT.
 """
 import asyncio
 import glob
-import json
 import os
 import re
-import shutil
 import subprocess
 import tempfile
-import threading
 import time
-import unicodedata
+from threading import Thread
 
+import imageio_ffmpeg
 from flask import Flask
 from google import genai
-from pyrogram import Client, filters
-from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from telethon import TelegramClient, events
 
-API_ID = int(os.environ["API_ID"])
-API_HASH = os.environ["API_HASH"]
-BOT_TOKEN = os.environ["BOT_TOKEN"]
-ADMIN_ID = int(os.environ["ADMIN_ID"])
-GEMINI_KEY = os.environ.get("GEMINI_API_KEY", "")
+API_ID = int(os.environ["TELEGRAM_API_ID"])
+API_HASH = os.environ["TELEGRAM_API_HASH"]
+BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
+GEMINI_KEY = os.environ["GEMINI_API_KEY"]
 MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash")
-CHUNK_SEC = int(os.environ.get("CHUNK_SECONDS", "300"))  # 5 min (shorter = less timing drift)
-MAX_CUE = int(os.environ.get("MAX_CUE_CHARS", "36"))     # max visible chars per subtitle
-LINE_LEN = int(os.environ.get("LINE_CHARS", "22"))       # wrap to 2nd line after this many
-EN_MAX_CUE = int(os.environ.get("EN_MAX_CUE_CHARS", "42"))  # English-only: max chars per subtitle
-EN_LINE_LEN = int(os.environ.get("EN_LINE_CHARS", "32"))    # English-only: wrap after this many
-SHIFT_MS = int(os.environ.get("SUB_DELAY_MS", "0"))      # +/- manual timing shift (ms)
-CONTEXT = os.environ.get("VIDEO_CONTEXT", "").strip()    # optional hint, e.g. "anime recap"
-OVERLAP = 5  # seconds (video splitter)
-DB = "users.json"
+MAX_MB = int(os.environ.get("MAX_FILE_MB", "1000"))
+CHUNK_SEC = int(os.environ.get("CHUNK_SECONDS", "600"))  # minimum chunk length (10 min)
+MAX_CHUNK_SEC = int(os.environ.get("MAX_CHUNK_SECONDS", "1500"))  # chunks grow up to 25 min on very long files
+REQ_BUDGET = int(os.environ.get("REQUEST_BUDGET", "18"))  # Gemini requests we allow ourselves per file (free tier is ~20/day/model)
+MODELS = [m.strip() for m in os.environ.get("GEMINI_MODELS", MODEL).split(",") if m.strip()] or [MODEL]
+PARALLEL = int(os.environ.get("GEMINI_PARALLEL", "3"))     # chunks transcribed at the same time
+MAX_CUE = int(os.environ.get("MAX_CUE_CHARS", "36"))    # max visible characters per subtitle
+LINE_LEN = int(os.environ.get("LINE_CHARS", "22"))      # wrap to a 2nd line after this many
+SHIFT_MS = int(os.environ.get("SUB_DELAY_MS", "0"))     # +/- manual timing shift (ms), e.g. -300
+CONTEXT = os.environ.get("VIDEO_CONTEXT", "").strip()   # optional hint, e.g. "anime recap, narrator voice"
+# Private bot: comma-separated Telegram user IDs allowed to use it, e.g. "123456789,987654321"
+ALLOWED = {int(x) for x in re.split(r"[,\s]+", os.environ.get("ALLOWED_USER_IDS", "").strip()) if x.isdigit()}
 
-FFMPEG = "ffmpeg"
-client = genai.Client(api_key=GEMINI_KEY) if GEMINI_KEY else None
-app = Client("splitbot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
-lock = asyncio.Lock()  # one job at a time (free hosting is weak)
+FFMPEG = imageio_ffmpeg.get_ffmpeg_exe()
+client = genai.Client(api_key=GEMINI_KEY)
 
-
-# ---------- approved users ----------
-def load():
-    try:
-        return set(json.load(open(DB)))
-    except Exception:
-        return set()
-
-
-def save(s):
-    json.dump(list(s), open(DB, "w"))
-
-
-def allowed(uid):
-    return uid == ADMIN_ID or uid in load()
-
-
-# =====================================================================
-#  VIDEO SPLITTER
-# =====================================================================
-def get_duration(path):
-    out = subprocess.check_output(
-        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
-         "-of", "default=nw=1:nk=1", path])
-    return float(out.strip())
-
-
-def plan(total, L):
-    """Part1 = L+5s. Next parts start 5s before previous end, length L."""
-    parts, start, end = [], 0.0, min(L + OVERLAP, total)
-    parts.append((start, end - start))
-    while end < total - 1:
-        start = end - OVERLAP
-        end = min(start + L, total)
-        parts.append((start, end - start))
-    return parts
-
-
-class Cancelled(Exception):
-    pass
-
-
-JOBS = {}  # (chat_id, status message id) -> {"cancel": bool, "proc": Popen | None}
-
-
-def cut(src, dst, start, dur, job):
-    p = subprocess.Popen(
-        [FFMPEG, "-y", "-ss", str(start), "-i", src, "-t", str(dur),
-         "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28",
-         "-c:a", "aac", "-movflags", "+faststart", dst],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    job["proc"] = p
-    rc = p.wait()
-    job["proc"] = None
-    if job["cancel"]:
-        raise Cancelled()
-    if rc != 0:
-        raise RuntimeError("ffmpeg failed")
-
-
-# =====================================================================
-#  MYANMAR SRT  (ported from the old SRT bot)
-# =====================================================================
 PROMPT = """You are a professional Burmese subtitle translator and timer.
 Listen to this audio clip and write Myanmar (Burmese) subtitles for everything that is spoken.
 Output ONLY a valid SRT file (no explanations, no markdown fences).
@@ -126,53 +61,27 @@ TIMING:
 - Number entries from 1. If there is no speech, output nothing.
 """
 
-PROMPT_EN = """You are a professional English subtitle translator and timer.
-Listen to this audio clip and write English subtitles for everything that is spoken.
-Output ONLY a valid SRT file (no explanations, no markdown fences).
+# ---------- Web server (keeps Render awake; also serves the video site if videosite.py exists) ----------
+try:
+    from videosite import app as web  # members video site (same service, same free hours)
+except Exception as e:  # not uploaded / not configured: fall back to a tiny keep-alive page
+    print("videosite not loaded:", e)
+    web = Flask(__name__)
 
-TRANSLATION QUALITY (most important):
-- Translate the MEANING, not word by word. Write natural, fluent, conversational English the way a native speaker would say it.
-- Keep the same tone as the speaker (funny, serious, dramatic). Keep names consistent through the whole clip.
-- Do not add, invent or skip content. Ignore filler sounds.
+    @web.route("/")
+    def home():
+        return "Bot is running"
 
-SUBTITLE LAYOUT:
-- Each subtitle must be SHORT: one phrase or short sentence, at most about 38 characters (hard limit 42).
-  Split long sentences into several consecutive subtitles at natural phrase breaks.
-- Each subtitle should last about 1 to 5 seconds.
+    @web.route("/healthz")
+    def healthz():
+        return "ok"
 
-TIMING:
-- Timestamp format HH:MM:SS,mmm --> HH:MM:SS,mmm, relative to the start of THIS clip (starts at 00:00:00,000).
-- A subtitle must appear exactly when its words start being spoken and disappear when they end.
-  Do not start early, do not stretch across silence, no overlaps, strictly increasing order.
-- Number entries from 1. If there is no speech, output nothing.
-"""
 
-PROMPT_BOTH = """You are a professional bilingual subtitle translator and timer (Burmese + English).
-Listen to this audio clip and write subtitles for everything that is spoken.
-Output ONLY a valid SRT file (no explanations, no markdown fences).
+def run_web():
+    web.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)), threaded=True)
 
-EVERY subtitle has EXACTLY TWO lines, with no blank line between them:
-  line 1 = Myanmar (Burmese) subtitle
-  line 2 = English subtitle with the same meaning
 
-TRANSLATION QUALITY (most important):
-- Translate the MEANING, not word by word. Myanmar line: everyday spoken Burmese a native speaker would naturally say
-  (natural particles like ပါတယ်/တယ်/လေ/ဟာ), Myanmar Unicode only (never Zawgyi). English line: natural, fluent, conversational English.
-- Keep the same tone as the speaker (funny, serious, dramatic). Keep names consistent through the whole clip.
-- Do not add, invent or skip content. Ignore filler sounds.
-
-SUBTITLE LAYOUT:
-- Each subtitle must be SHORT: Myanmar line at most about 30 Myanmar characters (hard limit 36), English line at most
-  about 42 characters. Split long sentences into several consecutive subtitles at natural phrase breaks.
-- Each subtitle should last about 1 to 5 seconds.
-
-TIMING:
-- Timestamp format HH:MM:SS,mmm --> HH:MM:SS,mmm, relative to the start of THIS clip (starts at 00:00:00,000).
-- A subtitle must appear exactly when its words start being spoken and disappear when they end.
-  Do not start early, do not stretch across silence, no overlaps, strictly increasing order.
-- Number entries from 1. If there is no speech, output nothing.
-"""
-
+# ---------- SRT helpers ----------
 _TS = r"(?:(\d+):)?(\d{1,2}):(\d{2})[,.](\d{1,3})"
 _BLOCK = re.compile(rf"{_TS}\s*-->\s*{_TS}[^\n]*\n(.*?)(?=\n\s*\n|\Z)", re.S)
 
@@ -202,35 +111,37 @@ def fmt_ts(ms):
     return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
 
 
+import unicodedata
+
 _SPLIT_AFTER = "။"
 
 
 def vlen(t):
     """Visible length: skip combining marks (Myanmar vowel signs/asat) so 1 syllable ~ 1 char."""
-    return sum(1 for c in t if not unicodedata.category(c).startswith("M") and c != "​")
+    return sum(1 for c in t if not unicodedata.category(c).startswith("M") and c != "\u200b")
 
 
 def _hard_split(tok, limit):
     """Split a space-less Myanmar string at syllable starts so each piece <= limit visible chars."""
     pieces = []
     while vlen(tok) > limit:
-        cut_at, count = None, 0
+        cut, count = None, 0
         for i, c in enumerate(tok):
             if not unicodedata.category(c).startswith("M"):
                 count += 1
             if count > limit:
                 break
             starts = (
-                i > 0 and "က" <= c <= "အ"
-                and tok[i - 1] not in "္"
-                and not (i + 1 < len(tok) and tok[i + 1] in "်္")
+                i > 0 and "\u1000" <= c <= "\u1021"
+                and tok[i - 1] not in "\u1039"
+                and not (i + 1 < len(tok) and tok[i + 1] in "\u103a\u1039")
             )
             if starts:
-                cut_at = i
-        if not cut_at:
+                cut = i
+        if not cut:
             break
-        pieces.append(tok[:cut_at])
-        tok = tok[cut_at:]
+        pieces.append(tok[:cut])
+        tok = tok[cut:]
     pieces.append(tok)
     return pieces
 
@@ -257,9 +168,9 @@ def _pack(text, limit):
     return pieces
 
 
-def _wrap(text, line_len=None):
+def _wrap(text):
     """Break one cue into max 2 balanced lines."""
-    if vlen(text) <= (line_len or LINE_LEN) or " " not in text:
+    if vlen(text) <= LINE_LEN or " " not in text:
         return text
     words, best, total = text.split(" "), None, vlen(text)
     for i in range(1, len(words)):
@@ -271,21 +182,18 @@ def _wrap(text, line_len=None):
     return " ".join(words[:i]) + "\n" + " ".join(words[i:])
 
 
-def refine(rows, max_cue=None, line_len=None, split=True):
+def refine(rows):
     """rows: sorted list of (start, end, text). Split long cues, fix timing/overlaps, wrap lines."""
-    max_cue = max_cue or MAX_CUE
-    line_len = line_len or LINE_LEN
     out = []
+    last_texts = []
     for s, e, body in rows:
-        if not split:  # bilingual: keep the 2 lines exactly as written, only fix timing
-            if e <= s:
-                e = s + 2000
-            out.append([int(s), int(e), "\n".join(l.strip() for l in body.split("\n") if l.strip())])
-            continue
         text = " ".join(body.split())
+        if len(last_texts) >= 2 and text == last_texts[-1] == last_texts[-2]:
+            continue  # model got stuck repeating the same line: drop the 3rd+ copy
+        last_texts = (last_texts + [text])[-2:]
         if e <= s:
             e = s + 2000
-        pieces = _pack(text, max_cue) or [text]
+        pieces = _pack(text, MAX_CUE) or [text]
         weights = [max(1, vlen(p)) for p in pieces]
         total, t = sum(weights), s
         for p, w in zip(pieces, weights):
@@ -302,295 +210,278 @@ def refine(rows, max_cue=None, line_len=None, split=True):
             r[1] = r[0] + 700
             if i + 1 < len(out) and r[1] > out[i + 1][0]:
                 out[i + 1][0] = r[1] + 30
-    return [(a, b, _wrap(c, line_len) if split else c) for a, b, c in out]
+    return [(a, b, _wrap(c)) for a, b, c in out]
 
 
-def merge_srt(chunks, mode="my"):
-    """chunks: list of (offset_ms, entries). Returns final SRT text."""
+def merge_srt(chunks):
+    """chunks: list of (offset_ms, entries[, length_ms]). Returns final SRT text."""
     rows = []
-    for offset, entries in chunks:
+    for ch in chunks:
+        offset, entries = ch[0], ch[1]
+        length = ch[2] if len(ch) > 2 else None
         for start, end, body in entries:
+            if length and start > length + 1000:  # model invented a time beyond this clip
+                continue
+            if length:
+                end = min(end, length + 500)
             s, e = max(0, start + offset + SHIFT_MS), max(0, end + offset + SHIFT_MS)
             if e <= s:
                 e = s + 1000
             rows.append((s, e, body))
     rows.sort(key=lambda r: r[0])
-    if mode == "en":
-        rows = refine(rows, EN_MAX_CUE, EN_LINE_LEN)
-    elif mode == "both":
-        rows = refine(rows, split=False)
-    else:
-        rows = refine(rows)
+    rows = refine(rows)
     lines = []
     for i, (s, e, body) in enumerate(rows, 1):
         lines.append(f"{i}\n{fmt_ts(s)} --> {fmt_ts(e)}\n{body}\n")
     return "\n".join(lines)
 
 
-def prepare_chunks(src, workdir, job):
+# ---------- Media + Gemini ----------
+def probe_duration(src):
+    """Total length in seconds (from ffmpeg's banner), or 0 if unknown."""
+    r = subprocess.run([FFMPEG, "-nostdin", "-i", src], capture_output=True)
+    m = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", r.stderr.decode(errors="ignore"))
+    return int(int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3))) if m else 0
+
+
+def pick_chunk_sec(total):
+    """Longer files -> bigger chunks so we stay inside Gemini's small free daily request quota."""
+    if not total:
+        return CHUNK_SEC
+    return max(CHUNK_SEC, min(MAX_CHUNK_SEC, -(-total // REQ_BUDGET)))
+
+
+def prepare_chunks(src, workdir, chunk_sec):
+    """Convert to small mono mp3 pieces. Returns (files, start_ms_list)."""
     pattern = os.path.join(workdir, "chunk_%03d.mp3")
+    listing = os.path.join(workdir, "list.csv")
     cmd = [
-        FFMPEG, "-y", "-i", src, "-vn", "-ac", "1", "-ar", "16000", "-b:a", "32k",
-        "-f", "segment", "-segment_time", str(CHUNK_SEC), "-reset_timestamps", "1", pattern,
+        FFMPEG, "-nostdin", "-loglevel", "error", "-y", "-i", src, "-vn", "-ac", "1", "-ar", "16000", "-b:a", "32k",
+        "-f", "segment", "-segment_time", str(chunk_sec), "-reset_timestamps", "1",
+        "-segment_list", listing, "-segment_list_type", "csv", pattern,
     ]
-    p = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-    job["proc"] = p
-    err = p.communicate()[1]
-    job["proc"] = None
-    if job["cancel"]:
-        raise Cancelled()
-    if p.returncode != 0:
-        raise RuntimeError("ffmpeg error: " + err.decode(errors="ignore")[-300:])
-    files = sorted(glob.glob(os.path.join(workdir, "chunk_*.mp3")))
+    r = subprocess.run(cmd, capture_output=True)
+    if r.returncode != 0:
+        raise RuntimeError("ffmpeg error: " + r.stderr.decode(errors="ignore")[-300:])
+    files, starts = [], []
+    try:
+        for line in open(listing, encoding="utf-8"):
+            parts = line.strip().split(",")
+            if len(parts) >= 3 and os.path.exists(os.path.join(workdir, parts[0])):
+                files.append(os.path.join(workdir, parts[0]))
+                starts.append(int(float(parts[1]) * 1000))
+    except OSError:
+        pass
+    if not files:  # fallback: fixed-length assumption
+        files = sorted(glob.glob(os.path.join(workdir, "chunk_*.mp3")))
+        starts = [i * chunk_sec * 1000 for i in range(len(files))]
     if not files:
         raise RuntimeError("အသံမတွေ့ပါ (no audio found)")
-    return files
+    return files, starts
 
 
-def transcribe_chunk(path, base_prompt=None):
+class QuotaExhausted(Exception):
+    pass
+
+
+_dead = {}  # model -> time it hit its daily limit
+DEAD_SECONDS = 6 * 3600
+
+
+def _alive_models():
+    now = time.time()
+    return [m for m in MODELS if now - _dead.get(m, 0) > DEAD_SECONDS]
+
+
+def transcribe_chunk(path):
+    prompt = PROMPT + (f"\nVideo context: {CONTEXT}\n" if CONTEXT else "")
+    f = None
     last = None
-    for attempt in range(3):
-        f = None
-        try:
-            f = client.files.upload(file=path)
-            while f.state.name == "PROCESSING":
-                time.sleep(2)
-                f = client.files.get(name=f.name)
-            if f.state.name != "ACTIVE":
-                raise RuntimeError(f"Gemini upload failed: {f.state.name}")
-            prompt = (base_prompt or PROMPT) + (f"\nVideo context: {CONTEXT}\n" if CONTEXT else "")
-            resp = client.models.generate_content(model=MODEL, contents=[prompt, f])
-            return resp.text or ""
-        except Exception as e:  # retry a couple of times
-            last = e
-            time.sleep(5 * (attempt + 1))
-        finally:
-            if f is not None:
-                try:
-                    client.files.delete(name=f.name)
-                except Exception:
-                    pass
-    raise last
-
-
-# =====================================================================
-#  TELEGRAM HANDLERS
-# =====================================================================
-async def ask_admin(u):
-    kb = InlineKeyboardMarkup([[
-        InlineKeyboardButton("✅ Approve", callback_data=f"ap:{u.id}"),
-        InlineKeyboardButton("❌ Reject", callback_data=f"rj:{u.id}")]])
-    await app.send_message(
-        ADMIN_ID, f"ခွင့်ပြုချက်တောင်းနေသူ: {u.first_name} (@{u.username}) id={u.id}",
-        reply_markup=kb)
-
-
-@app.on_message(filters.command("start") & filters.private)
-async def start(_, m):
-    if allowed(m.from_user.id):
-        await m.reply("Video/mp3 ပို့ပါ။ ✂️ အပုဒ်ခွဲမလား 📝 မြန်မာ SRT ထုတ်မလား ရွေးနိုင်ပါတယ်။")
-    else:
-        await ask_admin(m.from_user)
-        await m.reply("Admin ခွင့်ပြုချက် စောင့်ပါ။ ခွင့်ပြုပြီးရင် အသိပေးပါမယ်။")
-
-
-@app.on_message(filters.command("approve") & filters.user(ADMIN_ID))
-async def approve(_, m):
-    s = load(); s.add(int(m.command[1])); save(s)
-    await m.reply("✅ ခွင့်ပြုပြီး")
-
-
-@app.on_message(filters.command("remove") & filters.user(ADMIN_ID))
-async def remove(_, m):
-    s = load(); s.discard(int(m.command[1])); save(s)
-    await m.reply("🗑 ဖယ်ပြီး")
-
-
-@app.on_message(filters.command("users") & filters.user(ADMIN_ID))
-async def users(_, m):
-    await m.reply("Approved: " + (", ".join(map(str, load())) or "မရှိသေး"))
-
-
-@app.on_message(filters.private & (filters.video | filters.audio | filters.voice | filters.document))
-async def got_media(_, m):
-    mime = ((m.document.mime_type if m.document else "") or "").lower()
-    is_video = bool(m.video) or mime.startswith("video")
-    is_audio = bool(m.audio or m.voice) or mime.startswith("audio")
-    if not (is_video or is_audio):
-        return
-    if not allowed(m.from_user.id):
-        await ask_admin(m.from_user)
-        return await m.reply("Admin ခွင့်ပြုချက် လိုပါတယ်။ Admin ကို တောင်းခံပြီးပါပြီ။")
-    rows = []
-    if is_video:
-        rows.append([InlineKeyboardButton(f"✂️ {n} min", callback_data=f"len:{n}:{m.id}")
-                     for n in (1, 2, 3, 4, 5)])
-    rows.append([InlineKeyboardButton("📝 မြန်မာ SRT", callback_data=f"srt:{m.id}"),
-                 InlineKeyboardButton("🇬🇧 English SRT", callback_data=f"sre:{m.id}")])
-    rows.append([InlineKeyboardButton("🇲🇲+🇬🇧 မြန်မာ + English (နှစ်ဘာသာ)", callback_data=f"srb:{m.id}")])
-    await m.reply("ဘာလုပ်မလဲ?", reply_markup=InlineKeyboardMarkup(rows), quote=True)
-
-
-@app.on_callback_query()
-async def cb(_, q):
-    d = q.data.split(":")
-    if d[0] in ("ap", "rj") and q.from_user.id == ADMIN_ID:
-        uid = int(d[1])
-        if d[0] == "ap":
-            s = load(); s.add(uid); save(s)
-            await app.send_message(uid, "✅ ခွင့်ပြုပြီးပါပြီ။ Video ပို့လို့ရပါပြီ။")
-        await q.message.edit_text(("✅ Approved " if d[0] == "ap" else "❌ Rejected ") + str(uid))
-    elif d[0] == "len" and allowed(q.from_user.id):
-        L = int(d[1]) * 60
-        src_msg = await app.get_messages(q.message.chat.id, int(d[2]))
-        await q.message.edit_text("⏳ တန်းစီစောင့်နေပါတယ်...", reply_markup=cancel_kb(q.message.id))
-        asyncio.create_task(process(q.message, src_msg, L))
-    elif d[0] in ("srt", "sre", "srb") and allowed(q.from_user.id):
-        mode = {"srt": "my", "sre": "en", "srb": "both"}[d[0]]
-        src_msg = await app.get_messages(q.message.chat.id, int(d[1]))
-        await q.message.edit_text("⏳ တန်းစီစောင့်နေပါတယ်...", reply_markup=cancel_kb(q.message.id))
-        asyncio.create_task(process_srt(q.message, src_msg, mode))
-    elif d[0] == "cx":
-        job = JOBS.get((q.message.chat.id, int(d[1])))
-        if job:
-            job["cancel"] = True
-            p = job["proc"]
-            if p:
-                try:
-                    p.terminate()
-                except Exception:
-                    pass
-            return await q.answer("ရပ်နေပါတယ်...")
-        return await q.answer("ဒီ job ပြီးသွားပါပြီ")
-    await q.answer()
-
-
-def cancel_kb(mid):
-    return InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"cx:{mid}")]])
-
-
-async def upd(status, text):
     try:
-        await status.edit_text(text, reply_markup=cancel_kb(status.id))
-    except Exception:
-        pass
+        for up in range(3):
+            try:
+                f = client.files.upload(file=path)
+                while f.state.name == "PROCESSING":
+                    time.sleep(2)
+                    f = client.files.get(name=f.name)
+                if f.state.name != "ACTIVE":
+                    raise RuntimeError(f"Gemini upload failed: {f.state.name}")
+                break
+            except Exception as e:
+                last = e
+                f = None
+                time.sleep(5 * (up + 1))
+        if f is None:
+            raise last
+        overloaded = 0
+        for attempt in range(8):
+            alive = _alive_models()
+            if not alive:
+                raise QuotaExhausted("daily quota used up on all models")
+            model = alive[min(overloaded // 2, len(alive) - 1)]
+            try:
+                resp = client.models.generate_content(model=model, contents=[prompt, f])
+                return resp.text or ""
+            except Exception as e:
+                last = e
+                msg = str(e)
+                low = msg.lower()
+                if "429" in msg or "RESOURCE_EXHAUSTED" in msg or "quota" in low:
+                    if "perday" in low.replace(" ", "").replace("_", "") or "per day" in low:
+                        _dead[model] = time.time()  # try the next model right away
+                        continue
+                    time.sleep(30 * (attempt + 1))
+                elif "503" in msg or "UNAVAILABLE" in msg or "overloaded" in low or "high demand" in low:
+                    overloaded += 1
+                    time.sleep(min(10 * 2 ** overloaded, 90))
+                else:
+                    time.sleep(5 * (attempt + 1))
+        raise last
+    finally:
+        if f is not None:
+            try:
+                client.files.delete(name=f.name)
+            except Exception:
+                pass
 
 
-def new_job(status):
-    job = {"cancel": False, "proc": None}
-    JOBS[(status.chat.id, status.id)] = job
-    return job
+# ---------- Telegram (Telethon) ----------
+bot = TelegramClient(None, API_ID, API_HASH)  # in-memory session
+sem = asyncio.Semaphore(1)  # one job at a time (small Render instance)
 
 
-def check(job):
-    if job["cancel"]:
-        raise Cancelled()
+async def check_allowed(event):
+    """Only allow-listed users. Everyone else just gets their own ID (private chats only)."""
+    if event.sender_id in ALLOWED:
+        return True
+    if event.is_private:
+        await event.reply(f"ဒီ bot က private ဖြစ်ပါတယ်။\nသင့် Telegram ID: {event.sender_id}")
+    return False
 
 
-async def dl_progress(current, total, job):
-    if job["cancel"]:
-        app.stop_transmission()
+@bot.on(events.NewMessage(pattern=r"^/start"))
+async def start(event):
+    if not await check_allowed(event):
+        return
+    await event.reply(
+        "မင်္ဂလာပါ! mp3 သို့မဟုတ် mp4 ဖိုင် ပို့ပေးပါ။ မြန်မာ .srt subtitle ပြန်ပို့ပေးပါမယ်။ "
+        f"(ဖိုင်ကြီးလည်း ရပါတယ်၊ {MAX_MB}MB အထိ)"
+    )
 
 
-async def download(src_msg, path, job):
-    f = await app.download_media(src_msg, file_name=path, progress=dl_progress, progress_args=(job,))
-    check(job)
-    if not f:
-        raise RuntimeError("Download မအောင်မြင်ပါ")
-    return f
+@bot.on(events.NewMessage(pattern=r"^/models"))
+async def models_cmd(event):
+    if not await check_allowed(event):
+        return
+    try:
+        def _list():
+            names = []
+            for m in client.models.list():
+                acts = getattr(m, "supported_actions", None) or []
+                if "gemini" in m.name and (not acts or "generateContent" in acts):
+                    names.append(m.name.replace("models/", ""))
+            return sorted(names)
+
+        names = await asyncio.to_thread(_list)
+        await event.reply(
+            "သုံးနေတဲ့ model: " + ", ".join(MODELS) + "\n\nသင့် key နဲ့ သုံးလို့ရတဲ့ model တွေ:\n" + "\n".join(names)[:3000]
+        )
+    except Exception as e:
+        await event.reply(f"model စာရင်း မရပါ: {str(e)[:300]}")
 
 
-async def process(status, src_msg, L):
-    job = new_job(status)
-    async with lock:
-        tmp = tempfile.mkdtemp()
+def _is_media(e):
+    f = e.file
+    if f is None or e.photo:
+        return False
+    mime = (f.mime_type or "").lower()
+    return mime.startswith("audio/") or mime.startswith("video/")
+
+
+@bot.on(events.NewMessage(func=_is_media))
+async def handle(event):
+    if not await check_allowed(event):
+        return
+    f = event.file
+    if f.size and f.size > MAX_MB * 1024 * 1024:
+        await event.reply(f"ဖိုင်က {MAX_MB}MB ထက်ကြီးနေပါတယ်။")
+        return
+    if sem.locked():
+        await event.reply("တခြားဖိုင်တစ်ခု လုပ်နေလို့ တန်းစီစောင့်နေပါတယ်...")
+    async with sem:
+        status = await event.reply("ဖိုင်ကို ဒေါင်းလုဒ်လုပ်နေပါတယ်...")
+        base = os.path.splitext(f.name or "subtitle")[0] or "subtitle"
+        ext = f.ext or ".mp4"
         try:
-            check(job)
-            await upd(status, "⬇️ Download လုပ်နေပါတယ်...")
-            src = await download(src_msg, os.path.join(tmp, "in.mp4"), job)
-            total = await asyncio.to_thread(get_duration, src)
-            parts = plan(total, L)
-            n = len(parts)
-            for i, (st, du) in enumerate(parts, 1):
-                check(job)
-                await upd(status, f"✂️ ဖြတ်/ပို့နေပါတယ် {i}/{n}")
-                out = os.path.join(tmp, f"p{i}.mp4")
-                await asyncio.to_thread(cut, src, out, st, du, job)
-                check(job)
-                await app.send_video(status.chat.id, out, caption=f"Part {i}/{n}",
-                                     duration=int(du), supports_streaming=True)
-                os.remove(out)
-            await status.edit_text(f"✅ ပြီးပါပြီ — စုစုပေါင်း {n} ပုဒ်")
-        except Cancelled:
-            await status.edit_text("❌ ရပ်လိုက်ပါပြီ")
-        except Exception as e:
-            await status.edit_text(f"❌ အမှားဖြစ်သွားတယ်: {str(e)[:500]}")
-        finally:
-            JOBS.pop((status.chat.id, status.id), None)
-            shutil.rmtree(tmp, ignore_errors=True)
+            with tempfile.TemporaryDirectory() as tmp:
+                src = await event.download_media(file=os.path.join(tmp, "input" + ext))
+                await status.edit("အသံကို ပြင်ဆင်နေပါတယ်...")
+                total = await asyncio.to_thread(probe_duration, src)
+                chunk_sec = pick_chunk_sec(total)
+                chunks, starts = await asyncio.to_thread(prepare_chunks, src, tmp, chunk_sec)
+                os.remove(src)
+                n = len(chunks)
+                results = [None] * n
+                failed = []
+                quota_hit = []
+                done = 0
+                psem = asyncio.Semaphore(PARALLEL)
 
+                async def work(i):
+                    nonlocal done
+                    async with psem:
+                        try:
+                            raw = await asyncio.to_thread(transcribe_chunk, chunks[i])
+                            length = (starts[i + 1] - starts[i]) if i + 1 < n else None
+                            results[i] = (starts[i], parse_srt(raw), length)
+                        except Exception as e:
+                            print("chunk failed", i, e)
+                            failed.append(i)
+                            if isinstance(e, QuotaExhausted):
+                                quota_hit.append(1)
+                        done += 1
+                        try:
+                            await status.edit(f"စာသားပြောင်းနေပါတယ် ({done}/{n})...")
+                        except Exception:
+                            pass
 
-MODE_PROMPT = {"my": None, "en": PROMPT_EN, "both": PROMPT_BOTH}
-
-
-async def process_srt(status, src_msg, mode="my"):
-    job = new_job(status)
-    if client is None:
-        JOBS.pop((status.chat.id, status.id), None)
-        return await status.edit_text("❌ GEMINI_API_KEY မထည့်ရသေးပါ")
-    async with lock:
-        tmp = tempfile.mkdtemp()
-        try:
-            check(job)
-            media = src_msg.video or src_msg.audio or src_msg.voice or src_msg.document
-            base = os.path.splitext(getattr(media, "file_name", None) or "subtitle")[0] or "subtitle"
-            await upd(status, "⬇️ Download လုပ်နေပါတယ်...")
-            src = await download(src_msg, os.path.join(tmp, "input"), job)
-            await upd(status, "🎧 အသံကို ပြင်ဆင်နေပါတယ်...")
-            chunks = await asyncio.to_thread(prepare_chunks, src, tmp, job)
-            os.remove(src)
-            results = []
-            for i, ch in enumerate(chunks):
-                check(job)
-                await upd(status, f"🧠 စာသားပြောင်းနေပါတယ် ({i + 1}/{len(chunks)})...")
-                raw = await asyncio.to_thread(transcribe_chunk, ch, MODE_PROMPT[mode])
-                results.append((i * CHUNK_SEC * 1000, parse_srt(raw)))
-            check(job)
-            srt = merge_srt(results, mode)
-            if not srt.strip():
-                return await status.edit_text("စကားပြောသံ မတွေ့ပါ၊ သို့မဟုတ် subtitle မထွက်ပါ။")
-            out = os.path.join(tmp, base + {"my": "_my", "en": "_en", "both": "_my_en"}[mode] + ".srt")
-            with open(out, "w", encoding="utf-8") as fh:
-                fh.write(srt)
-            await app.send_document(status.chat.id, out, caption="ပြီးပါပြီ ✅")
+                await status.edit(f"အပိုင်း {n} ပိုင်း ခွဲပြီးပါပြီ၊ စာသားပြောင်းနေပါတယ်...")
+                await asyncio.gather(*(work(i) for i in range(n)))
+                if failed and len(failed) == n:
+                    if quota_hit:
+                        raise RuntimeError(
+                            "Gemini အခမဲ့ quota (တစ်ရက်စာ) ကုန်သွားပါပြီ။ နောက်ရက် (မြန်မာစံတော်ချိန် ညနေ ၂ နာရီလောက်ကနေ) "
+                            "ပြန်စမ်းပါ၊ ဒါမှမဟုတ် GEMINI_MODELS မှာ တခြား model ထည့်ပါ။"
+                        )
+                    raise RuntimeError("Gemini က အပိုင်းအားလုံးကို မလုပ်နိုင်ပါ (network / overload ဖြစ်နိုင်)။ ခဏနေမှ ပြန်ကြိုးစားပါ။")
+                srt = merge_srt([r for r in results if r])
+                if not srt.strip():
+                    await status.edit("စကားပြောသံ မတွေ့ပါ၊ သို့မဟုတ် subtitle မထွက်ပါ။")
+                    return
+                out = os.path.join(tmp, base + ".srt")
+                with open(out, "w", encoding="utf-8") as fh:
+                    fh.write(srt)
+                caption = "ပြီးပါပြီ ✅"
+                if failed:
+                    parts = ", ".join(
+                        f"{fmt_ts(starts[i])[:8]}" for i in sorted(failed)
+                    )
+                    if quota_hit:
+                        caption = "⚠️ Gemini တစ်ရက်စာ quota ကုန်သွားလို့ အပိုင်း " + str(len(failed)) + " ခု မပါပါဘူး။ နောက်ရက်မှာ ဖိုင်ကို ပြန်ပို့ပါ။ မပါတဲ့ စချိန်: " + parts
+                    else:
+                        caption = f"⚠️ အပိုင်း {len(failed)} ခု မရလိုက်ပါ (စချိန်: {parts})။ ကျန်တာတွေ ပါပါတယ်။ ထပ်ပို့ကြည့်ပါ။"
+                await bot.send_file(event.chat_id, out, caption=caption[:900], reply_to=event.id)
             await status.delete()
-        except Cancelled:
-            await status.edit_text("❌ ရပ်လိုက်ပါပြီ")
         except Exception as e:
-            await status.edit_text(f"အမှားတက်သွားပါတယ်: {str(e)[:500]}")
-        finally:
-            JOBS.pop((status.chat.id, status.id), None)
-            shutil.rmtree(tmp, ignore_errors=True)
+            await status.edit(f"အမှားတက်သွားပါတယ်: {str(e)[:500]}")
 
 
-# ---------- web server (keeps Render awake; serves videosite.py if present) ----------
-try:
-    from videosite import app as web
-except Exception as e:
-    print("videosite not loaded:", e)
-    web = Flask(__name__)
-
-    @web.route("/")
-    def home():
-        return "Bot is running"
-
-    @web.route("/healthz")
-    def healthz():
-        return "ok"
+def main():
+    Thread(target=run_web, daemon=True).start()
+    bot.start(bot_token=BOT_TOKEN)
+    print("Bot started")
+    bot.run_until_disconnected()
 
 
-threading.Thread(
-    target=lambda: web.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)), threaded=True),
-    daemon=True).start()
-
-app.run()
+if __name__ == "__main__":
+    main()
