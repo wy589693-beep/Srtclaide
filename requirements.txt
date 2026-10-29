@@ -1,0 +1,7 @@
+pyrogram
+tgcrypto
+google-genai
+flask
+imageio-ffmpeg
+requests
+psycopg2-binary
