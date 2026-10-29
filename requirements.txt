@@ -1,4 +1,6 @@
-pyrofork
-tgcrypto
-flask
+telethon>=1.36
 google-genai
+flask
+imageio-ffmpeg
+requests
+psycopg2-binary
